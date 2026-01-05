@@ -1,4 +1,6 @@
 use rustcraft::buffer::{BUFFER_SIZE, BufferReader};
+use rustcraft::connection::{Connection, ConnectionState};
+
 use rustcraft::packets::try_next_packet;
 use std::error::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,13 +15,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         let (mut socket, peer) = listener.accept().await?;
-        println!("\n\naccepted from {peer}\n----------------------");
+
+        println!("\n\nAccepted from {peer}\n----------------------");
 
         tokio::spawn(async move {
+            let mut connection = Connection::new(
+                peer.ip().to_string(),
+                peer.port(),
+                socket,
+                ConnectionState::Handshake,
+            );
             let mut buffer_reader = BufferReader::new();
             loop {
                 let mut temp = [0; BUFFER_SIZE];
-                let n = match socket.read(&mut temp).await {
+                let n = match connection.socket.read(&mut temp).await {
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("read error from {peer}: {e}\n----------------------");
@@ -34,13 +43,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 loop {
                     match try_next_packet(&mut buffer_reader) {
-                        Ok(Some(packet_bytes)) => {
-                            println!("got packet payload len={}", packet_bytes.len());
-                            println!("packet: {:?}", packet_bytes)
+                        Ok(Some(mut packet)) => {
+                            connection.process(&mut packet).await;
                         }
                         Ok(None) => break, // need more data
                         Err(e) => {
                             eprintln!("protocol error from {peer}: {e}");
+                            eprintln!("{:?}", buffer_reader.unread());
                             return;
                         }
                     }
