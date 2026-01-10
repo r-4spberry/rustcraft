@@ -1,8 +1,8 @@
-use std::thread::current;
-
+use std::{any, thread::current};
+use log::debug;
 use thiserror::Error;
 
-use crate::buffer::BufferReader;
+use crate::{net::ConnectionState, packet::Packet};
 
 #[derive(Error, Debug)]
 pub enum DataError {
@@ -20,7 +20,6 @@ pub enum Data {
 
 const SEGMENT_BITS: u8 = 0x7F;
 const CONTINUE_BIT: u8 = 0x80;
-
 
 pub fn create_string(data: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -120,7 +119,7 @@ pub fn read_varint(bytes: &mut Vec<u8>) -> Result<i32, DataError> {
 
         position += 7;
         i += 1;
-        
+
         if position >= 32 {
             // No need to drain here, breaking
             return Err(DataError::VarIntTooBig);
@@ -129,26 +128,25 @@ pub fn read_varint(bytes: &mut Vec<u8>) -> Result<i32, DataError> {
     Ok(value)
 }
 
-// Technically, this is the only function that *needs* to give out an Option because everything else should be called on a full packet
+// Technically, this is the only function that *needs* to give out an Option
+// because everything else should be called on a full packet
 // this one may be used to get length of a packet - so it can be broken.
-pub fn try_read_varint(buf: &mut BufferReader) -> Result<Option<i32>, DataError> {
+pub fn try_read_varint_len(buf: &[u8]) -> Result<Option<(usize, usize)>, DataError> {
     let mut value: i32 = 0;
     let mut position: u8 = 0;
     let mut i: usize = 0;
-    let bytes = buf.unread();
     loop {
-        if i >= bytes.len() {
+        if i >= buf.len() {
             //Not enough bytes
             return Ok(None);
         }
 
-        let current_byte = bytes[i];
+        let current_byte = buf[i];
 
         value |= ((current_byte & SEGMENT_BITS) as i32) << position;
 
         if current_byte & CONTINUE_BIT == 0 {
             i += 1;
-            buf.advance(i);
             break;
         }
 
@@ -159,5 +157,33 @@ pub fn try_read_varint(buf: &mut BufferReader) -> Result<Option<i32>, DataError>
             return Err(DataError::VarIntTooBig);
         }
     }
-    Ok(Some(value))
+
+    assert!(value > 0);
+    Ok(Some((value as usize, i)))
+}
+
+pub fn parse_handshake_next_state(packet: Packet) -> anyhow::Result<ConnectionState> {
+    if packet.id() != 0x00 {
+        anyhow::bail!("unexpected id");
+    }
+    let mut data = packet.data_owned();
+    let protocol_version = read_varint(&mut data)?;
+    let server_address = read_string(&mut data)?;
+    let server_port = read_unsigned_short(&mut data)?;
+    let intent = match read_varint(&mut data)? {
+        1 => ConnectionState::Status,
+        2 => ConnectionState::Login,
+        3 => ConnectionState::Transfer,
+        _ => panic!("Unreachable")
+    };
+    debug!("parsing handshake: {protocol_version} {server_address} \
+            {server_port} {intent:?}");
+    Ok(intent)
+}
+
+pub fn create_sendable_packet(packet: Packet) -> Vec<u8> {
+    let len = packet.len();
+    let mut len_bytes = create_varint(len as i32);
+    len_bytes.extend_from_slice(packet.payload());
+    len_bytes
 }

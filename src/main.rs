@@ -1,65 +1,41 @@
-use rustcraft::buffer::{BUFFER_SIZE, BufferReader};
-use rustcraft::connection::{Connection, ConnectionState};
+mod server;
+mod net;
+mod messages;
+mod framing;
+mod protocol;
+mod packet;
 
-use rustcraft::packets::try_next_packet;
-use std::error::Error;
+use dotenv::dotenv;
+use log::{error, info, warn};
+use std::env;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+
+use crate::net::run_acceptor;
+use crate::server::run_core;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let addr = "127.0.0.1:1337";
-    let listener = TcpListener::bind(&addr).await?;
-
-    println!("Listening on: {}", addr);
-
-    loop {
-        let (mut socket, peer) = listener.accept().await?;
-
-        println!("\n\nAccepted from {peer}\n----------------------");
-
-        tokio::spawn(async move {
-            let mut connection = Connection::new(
-                peer.ip().to_string(),
-                peer.port(),
-                socket,
-                ConnectionState::Handshake,
-            );
-            let mut buffer_reader = BufferReader::new();
-            loop {
-                let mut temp = [0; BUFFER_SIZE];
-                let n = match connection.socket.read(&mut temp).await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("read error from {peer}: {e}\n----------------------");
-                        return;
-                    }
-                };
-
-                if let Err(e) = buffer_reader.append(temp, n) {
-                    eprintln!("buffer overflow from {peer}");
-                    return;
-                }
-
-                loop {
-                    match try_next_packet(&mut buffer_reader) {
-                        Ok(Some(mut packet)) => {
-                            connection.process(&mut packet).await;
-                        }
-                        Ok(None) => break, // need more data
-                        Err(e) => {
-                            eprintln!("protocol error from {peer}: {e}");
-                            eprintln!("{:?}", buffer_reader.unread());
-                            return;
-                        }
-                    }
-                }
-
-                if n == 0 {
-                    println!("closed by {peer}");
-                    return;
-                }
-            }
-        });
+async fn main() -> anyhow::Result<()> {
+    dotenv().ok();
+    
+    if std::env::var_os("RUST_LOG").is_none() {
+        panic!("RUST_LOG should be set in env");
     }
+    
+    env_logger::init();        
+    
+    info!("Starting server...");
+    let addr = env::var("SERVER_ADDR").unwrap_or_else(|_| {
+        warn!("SERVER_ADDR environment variable not set, using default address");
+        "127.0.0.1:1333".to_string()
+    });
+
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    info!("Listening on {}", addr);
+
+    let (core_tx, core_rx) = mpsc::channel::<messages::ServerMsg>(1024);
+    tokio::spawn(server::run_core(core_rx));
+    run_acceptor(listener, core_tx).await?;
+    Ok(())
 }
